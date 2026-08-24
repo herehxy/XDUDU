@@ -2,6 +2,7 @@
 
 mod approval_prompt;
 mod doctor;
+mod inline_terminal;
 mod input_editor;
 mod input_queue;
 mod markdown;
