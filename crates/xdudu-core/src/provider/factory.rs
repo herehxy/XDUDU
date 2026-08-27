@@ -88,6 +88,7 @@ mod tests {
             temperature: 0.2,
             max_output_tokens: 4096,
             reasoning: false,
+            max_context_tokens: 0,
         };
         let provider = DefaultProviderFactory
             .create(&config, SecretString::new("test-key").unwrap())
@@ -108,6 +109,7 @@ mod tests {
             temperature: 0.2,
             max_output_tokens: 4096,
             reasoning: false,
+            max_context_tokens: 0,
         };
         let provider = DefaultProviderFactory
             .create(&config, SecretString::new("test-key").unwrap())

@@ -132,19 +132,31 @@ pub async fn run_git(
     })
 }
 
-pub async fn repository_root(workspace: &Path) -> Result<(PathBuf, PathBuf), String> {
+/// 从 `start` 目录向上发现 Git 仓库；工作区边界仍以 `workspace` 为准，
+/// 仓库根和元数据目录都必须位于工作区内。用于目标项目位于工作区子目录、
+/// 而工作区根本身不是 Git 仓库的场景。
+pub async fn repository_root_at(
+    workspace: &Path,
+    start: &Path,
+) -> Result<(PathBuf, PathBuf), String> {
     let workspace = tokio::fs::canonicalize(workspace)
         .await
         .map_err(|error| format!("工作区无效：{error}"))?;
+    let start = tokio::fs::canonicalize(start)
+        .await
+        .map_err(|error| format!("起始目录无效：{error}"))?;
+    if !start.starts_with(&workspace) {
+        return Err("起始目录位于 XDUDU 工作区外，已拒绝访问。".into());
+    }
     let args = vec![
         "--no-optional-locks".to_owned(),
         "rev-parse".to_owned(),
         "--show-toplevel".to_owned(),
     ];
-    let output = run_git(&workspace, &workspace, &args, 16 * 1024).await?;
+    let output = run_git(&workspace, &start, &args, 16 * 1024).await?;
     if !output.status.success() {
         return Err(format!(
-            "当前工作区不是 Git 仓库：{}",
+            "当前目录不是 Git 仓库：{}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
@@ -212,7 +224,39 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let error = repository_root(&workspace).await.unwrap_err();
+        let error = repository_root_at(&workspace, &workspace)
+            .await
+            .unwrap_err();
         assert!(error.contains("元数据目录位于 XDUDU 工作区外"));
+    }
+
+    #[tokio::test]
+    async fn 从工作区子目录发现嵌套仓库() {
+        let parent = tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        let project = workspace.join("projects").join("target");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet", project.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let workspace = tokio::fs::canonicalize(&workspace).await.unwrap();
+        let project = tokio::fs::canonicalize(&project).await.unwrap();
+        let (resolved_workspace, root) = repository_root_at(&workspace, &project)
+            .await
+            .expect("应发现嵌套仓库");
+        assert_eq!(resolved_workspace, workspace);
+        assert_eq!(root, project);
+    }
+
+    #[tokio::test]
+    async fn 工作区根非仓库时从子目录出发会失败() {
+        let parent = tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        let project = workspace.join("projects").join("target");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+        let error = repository_root_at(&workspace, &project).await.unwrap_err();
+        assert!(error.contains("不是 Git 仓库"));
     }
 }

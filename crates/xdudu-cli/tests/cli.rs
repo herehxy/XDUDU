@@ -706,11 +706,12 @@ fn 非交互默认拒绝写入且显式批准可以执行() {
         .args(["--no-stream", "创建 created.txt"])
         .output()
         .unwrap();
-    assert!(!denied.status.success());
+    // 审批拒绝是用户/策略决策，不阻止任务正常收尾（工具仍记为 denied）。
+    assert!(denied.status.success());
     assert!(!denied_dir.path().join("created.txt").exists());
     let denied_id = first_session_id(denied_dir.path());
     let denied_session = session_show(denied_dir.path(), &denied_id);
-    assert_eq!(denied_session["status"], "incomplete");
+    assert_eq!(denied_session["status"], "completed");
     assert_eq!(denied_session["toolCalls"][0]["status"], "denied");
     assert_eq!(
         denied_session["toolCalls"][0]["approval"]["approved"],

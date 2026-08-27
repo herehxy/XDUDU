@@ -66,16 +66,24 @@ pub struct StallSignal {
     pub recovery: String,
 }
 
-/// 构建恢复提示。`tool_names` 按连续失败工具名去重后生成。
-fn build_recovery(tool_names: &[String]) -> String {
-    if tool_names.is_empty() {
-        return "仍在低输出outputed循环：请不要重复相同命令或仅输出极短内容，先说明当前障碍，再选择一个不同的、可见进展的动作。".to_owned();
-    }
+/// 恢复提示中携带的最近错误详情最大字符数。
+const RECOVERY_ERROR_DETAIL_CHARS: usize = 200;
+
+/// 构建恢复提示：携带具体失败次数与最近一次错误详情，让模型能定位
+/// 失败原因并调整策略，而不是拿着套话盲目重试。
+fn build_recovery(tool_name: &str, repeats: usize, last_error: Option<&str>) -> String {
+    let detail = last_error
+        .map(|error| error.trim())
+        .filter(|error| !error.is_empty())
+        .map(|error| format!("最近一次失败原因：{error}。"))
+        .unwrap_or_default();
     format!(
-        "最近连续 {} 次以上执行「{}」失败。请停止用相同参数重试；建议先读取相关文件确认前置条件，考虑改用其它工具或方式，必要时说明存在的阻碍。",
-        tool_names.len(),
-        tool_names.join("、"),
+        "工具「{tool_name}」已连续失败 {repeats} 次。请不要再重试相同的参数或相同的命令写法；{detail}建议先读取相关文件确认前置条件（如路径是否存在、命令语法是否匹配当前系统），改用其它工具或方式，必要时直接向用户说明阻碍。"
     )
+}
+
+fn truncate_error_detail(error: &str) -> String {
+    error.chars().take(RECOVERY_ERROR_DETAIL_CHARS).collect()
 }
 
 /// 停滞检测器：维护最近工具动作的滑动窗口。
@@ -128,10 +136,16 @@ impl StallDetector {
         if *repeats < REPEAT_FAILURE_THRESHOLD {
             return None;
         }
+        // 窗口末尾即最近一次失败：携带其错误详情，恢复提示才有纠偏价值。
+        let last_error = self
+            .records
+            .back()
+            .and_then(|record| record.error.as_deref())
+            .map(truncate_error_detail);
         Some(StallSignal {
             repeats: *repeats,
             tool_names: vec![name.clone()],
-            recovery: build_recovery(std::slice::from_ref(name)),
+            recovery: build_recovery(name, *repeats, last_error.as_deref()),
         })
     }
 }
@@ -175,6 +189,28 @@ mod tests {
         assert_eq!(signal.repeats, 3);
         assert_eq!(signal.tool_names, vec!["file_write"]);
         assert!(signal.recovery.contains("file_write"));
+        // 提示携带真实失败次数与最近错误详情，而非泛化套话。
+        assert!(signal.recovery.contains("连续失败 3 次"));
+        assert!(signal.recovery.contains("boom"));
+    }
+
+    #[test]
+    fn 超长错误详情在恢复提示中被截断() {
+        let mut detector = StallDetector::new();
+        let mut record = failed("terminal_exec");
+        record.error = Some("x".repeat(1_000));
+        for _ in 0..2 {
+            detector.push(failed("terminal_exec"));
+        }
+        detector.push(record);
+        let signal = detector.consecutive_failures().unwrap();
+        let detail = signal
+            .recovery
+            .split("最近一次失败原因：")
+            .nth(1)
+            .and_then(|text| text.split('。').next())
+            .unwrap_or("");
+        assert_eq!(detail.chars().count(), RECOVERY_ERROR_DETAIL_CHARS);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! `git_status`：使用固定 Git 参数返回结构化仓库状态。
 
+use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -7,7 +8,8 @@ use serde_json::{Value, json};
 
 use crate::{SideEffectKind, permission::PermissionLevel};
 
-use super::git_common::{repository_root, run_git};
+use super::git_common::{repository_root_at, run_git};
+use super::path_policy::resolve_existing;
 use super::{Tool, ToolContext, ToolDefinition, ToolResult, object, reject_unknown_fields};
 
 const MAX_ENTRIES: usize = 10_000;
@@ -111,11 +113,13 @@ impl Tool for GitStatusTool {
         ToolDefinition {
             name: "git_status".into(),
             description:
-                "返回工作区 Git 分支、ahead/behind 以及暂存、修改、删除和未跟踪文件的结构化状态。"
+                "返回 Git 分支、ahead/behind 以及暂存、修改、删除和未跟踪文件的结构化状态。默认检查工作区根；目标项目位于工作区子目录时，用 path 指定该子目录。"
                     .into(),
             input_schema: json!({
                 "type":"object",
-                "properties":{},
+                "properties":{
+                    "path":{"type":"string","minLength":1,"maxLength":4096}
+                },
                 "additionalProperties":false
             }),
             permission_level: PermissionLevel::ReadOnly,
@@ -127,7 +131,15 @@ impl Tool for GitStatusTool {
     fn validate(&self, input: &Value) -> Result<(), Vec<String>> {
         let map = object(input)?;
         let mut issues = Vec::new();
-        reject_unknown_fields(map, &[], &mut issues);
+        reject_unknown_fields(map, &["path"], &mut issues);
+        if let Some(path) = map.get("path")
+            && (!path.is_string()
+                || path
+                    .as_str()
+                    .is_some_and(|value| value.is_empty() || value.len() > 4096))
+        {
+            issues.push("path 必须是 1 到 4096 字节的字符串。".into());
+        }
         if issues.is_empty() {
             Ok(())
         } else {
@@ -135,15 +147,30 @@ impl Tool for GitStatusTool {
         }
     }
 
-    async fn execute(&self, _input: Value, context: ToolContext) -> ToolResult {
-        let (workspace, root) = match repository_root(&context.cwd).await {
+    async fn execute(&self, input: Value, context: ToolContext) -> ToolResult {
+        // 目标项目位于工作区子目录时，从该子目录向上发现仓库根。
+        let start = match input.get("path").and_then(Value::as_str) {
+            Some(raw) => match resolve_existing(Path::new(raw), &context.cwd).await {
+                Ok(path) => path,
+                Err(error) => {
+                    return ToolResult::failure(
+                        "INVALID_GIT_PATH",
+                        error.message,
+                        context.started_at,
+                        json!({"path":raw}),
+                    );
+                }
+            },
+            None => context.cwd.clone(),
+        };
+        let (workspace, root) = match repository_root_at(&context.cwd, &start).await {
             Ok(value) => value,
             Err(message) => {
                 return ToolResult::failure(
                     "NOT_GIT_REPOSITORY",
                     message,
                     context.started_at,
-                    json!({}),
+                    json!({"start":start}),
                 );
             }
         };

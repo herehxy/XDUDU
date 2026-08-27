@@ -39,6 +39,15 @@ pub enum AgentEvent {
     UsageUpdated {
         usage: TokenUsage,
     },
+    /// 压缩/投影指标：layer 为 L1-projection / L2-deterministic / L3-llm。
+    CompactionApplied {
+        layer: String,
+        saved_tokens: u64,
+    },
+    /// 思维链增量：渲染层折叠为浅灰摘要，不与正文混排。
+    ReasoningDelta {
+        text: String,
+    },
     Warning {
         code: String,
         message: String,
@@ -82,6 +91,11 @@ pub enum AgentEvent {
         repeats: usize,
         tool_names: Vec<String>,
         recovery: String,
+    },
+    /// 段轮次预算用尽，任务自动续跑进入下一段。
+    Continuing {
+        segment: u32,
+        note: String,
     },
     /// 技能加载成功（索引与正文注入当前轮系统提示词）。
     SkillLoaded {
@@ -151,7 +165,7 @@ impl AgentEvent {
             Self::StateChanged { state } => {
                 ("agent_state", "Agent 运行状态变化", json!({"state": state}))
             }
-            Self::AssistantDelta { .. } => return None,
+            Self::AssistantDelta { .. } | Self::ReasoningDelta { .. } => return None,
             Self::ToolStarted { call_id, name } => (
                 "tool_started",
                 "工具调用开始",
@@ -248,6 +262,14 @@ impl AgentEvent {
             Self::PlanCompleted { plan_id } => {
                 ("plan_completed", "计划完成", json!({"planId": plan_id}))
             }
+            Self::CompactionApplied {
+                layer,
+                saved_tokens,
+            } => (
+                "compaction_applied",
+                "上下文压缩/投影已应用",
+                json!({"layer": layer, "savedTokens": saved_tokens}),
+            ),
             Self::StalledRecovery {
                 repeats,
                 tool_names,
@@ -259,6 +281,11 @@ impl AgentEvent {
                     "repeats": repeats,
                     "toolNames": tool_names,
                 }),
+            ),
+            Self::Continuing { segment, .. } => (
+                "continuing",
+                "段轮次预算用尽，自动续跑",
+                json!({"segment": segment}),
             ),
             Self::SkillLoaded { name } => ("skill_loaded", "技能加载成功", json!({"name": name})),
             Self::SubagentStarted { agent_id, prompt } => (
