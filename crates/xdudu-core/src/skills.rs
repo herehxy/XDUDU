@@ -328,7 +328,8 @@ mod tests {
             ),
         )
         .unwrap();
-        let (skills, warnings) = discover_skills(root.path());
+        // 注入 None 用户根：隔离本机 ~/.config/xdudu/skills 的真实技能。
+        let (skills, warnings) = discover_skills_with_user_root(root.path(), None);
         assert!(skills.is_empty());
         assert!(
             warnings

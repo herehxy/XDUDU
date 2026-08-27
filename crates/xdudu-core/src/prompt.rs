@@ -4,6 +4,21 @@ use std::path::Path;
 
 use crate::tools::ToolDefinition;
 
+/// 段轮次预算用尽时注入的续跑提示（对齐 Codex continuation 语义）：
+/// 目标保持完整、禁止缩小范围，先小结再推进，不重复已完成探索。
+pub fn continuation_prompt(segment: u32, remaining_total_turns: u32) -> String {
+    format!(
+        "本段轮次预算已用完（第 {segment} 段），总预算剩余 {remaining_total_turns} 轮。请继续推进原任务目标：\n\
+- 目标保持完整，不得缩小成“现在能完成的部分”，不得围绕更容易的子任务重新定义成功。\n\
+- 先用一两句话总结已有结论与待办，再选择一个可观察的下一步继续执行；不重复已完成的探索。\n\
+- 若同一阻塞条件已连续多轮无法解决，向用户明确说明障碍，不要原地反复重试。"
+    )
+}
+
+/// 总轮次预算耗尽时注入的收尾提示：不再开启新工作，输出可恢复的交接。
+pub const WRAP_UP_PROMPT: &str = "总轮次预算已用完，不要再开启新工作。请直接输出最终交接：\
+已完成的内容、已验证的结论、未完成事项与建议的下一步（可直接用于继续对话或 /resume 续跑）。";
+
 pub fn build_system_prompt(tools: &[ToolDefinition], cwd: &Path) -> String {
     build_system_prompt_with_instructions(tools, cwd, &[])
 }

@@ -55,10 +55,60 @@ pub struct ProviderConfig {
     pub min_request_interval_ms: u64,
     /// 模型请求采样温度，默认 0.2。
     pub temperature: f32,
-    /// 单次模型请求最大输出 Token，默认 4096。
+    /// 单次模型请求最大输出 Token，默认 8192。
     pub max_output_tokens: u32,
     /// 是否启用内部思考闭环（推理内容持久化并回传，不进入公开输出）。
     pub reasoning: bool,
+    /// 模型上下文窗口上限（Token 能力声明）：0 表示按内置模型表推导，
+    /// openai-compatible 等未知模型可用此覆盖。上下文压缩预算由此推导。
+    pub max_context_tokens: u32,
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            name: "deepseek".into(),
+            model: DEFAULT_DEEPSEEK_MODEL.into(),
+            base_url: None,
+            timeout_seconds: 180,
+            max_attempts: 3,
+            retry_base_ms: 500,
+            min_request_interval_ms: 0,
+            temperature: 0.2,
+            max_output_tokens: 8192,
+            reasoning: false,
+            max_context_tokens: 0,
+        }
+    }
+}
+
+impl ProviderConfig {
+    /// 按模型能力推导上下文输入预算：窗口的 3/4（预留输出与系统空间），
+    /// 下限 8,000。`max_context_tokens` 显式设置时优先。
+    pub fn context_budget(&self) -> XduduResult<usize> {
+        let window = if self.max_context_tokens == 0 {
+            model_context_window(&self.name, &self.model)
+        } else {
+            self.max_context_tokens
+        } as usize;
+        if !(16_384..=1_048_576).contains(&window) {
+            return Err(config_error(
+                "provider.max_context_tokens 必须是 16384 到 1048576 之间的整数。",
+            ));
+        }
+        Ok((window * 3 / 4).max(8_000))
+    }
+}
+
+/// 内置模型上下文窗口表（Token，来源：各厂商公开规格）。
+/// deepseek-chat/deepseek-reasoner 及 deepseek-v4 系列为 128K；
+/// Anthropic Claude 系列 200K；openai-compatible 未知模型保守 64K。
+fn model_context_window(provider: &str, model: &str) -> u32 {
+    match provider {
+        "deepseek" if model.starts_with("deepseek") => 128_000,
+        "anthropic" if model.starts_with("claude") => 200_000,
+        _ => 64_000,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -75,6 +125,11 @@ pub struct AgentConfig {
     pub commands: CommandRules,
     /// 技能加载策略：allow | ask | deny（默认 allow）。
     pub skills: String,
+    /// 段轮次预算用尽时自动续跑：开启后打满 max_turns 不终止任务，
+    /// 注入续跑指令继续下一段；只有总预算或用户中断能停止。
+    pub auto_continue: bool,
+    /// 总轮次预算硬上限：所有段（含续跑）累计；达到后注入收尾指令交接。
+    pub max_total_turns: u32,
     /// 自定义 Agent 档案（不含内置；最终由调用方与内置档案合并）。
     pub profiles: Vec<AgentProfile>,
 }
@@ -106,6 +161,7 @@ impl CommandRules {
             "git show",
             "git branch",
             "git stash",
+            "git rev-parse",
             "cargo check",
             "cargo build",
             "cargo test",
@@ -149,6 +205,8 @@ impl Default for AgentConfig {
             stalled_max_recovery: 3,
             commands: CommandRules::default(),
             skills: "allow".into(),
+            auto_continue: true,
+            max_total_turns: 200,
             profiles: Vec::new(),
         }
     }
@@ -174,6 +232,16 @@ impl AgentConfig {
             "deny" => Ok(SkillMode::Deny),
             _ => Err(config_error("agent.skills 只能是 allow、ask 或 deny。")),
         }
+    }
+
+    /// 总轮次预算：1–1,000，默认 200。
+    pub fn max_total_turns(&self) -> XduduResult<u32> {
+        if !(1..=1_000).contains(&self.max_total_turns) {
+            return Err(config_error(
+                "agent.max_total_turns 必须是 1 到 1000 之间的整数。",
+            ));
+        }
+        Ok(self.max_total_turns)
     }
 }
 
@@ -205,6 +273,8 @@ pub struct OutputConfig {
     pub no_stream: bool,
     pub color: bool,
     pub debug_trace: bool,
+    /// TUI 配色主题：dark | light | auto（默认按终端背景探测）。
+    pub theme: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -309,6 +379,7 @@ struct FileProvider {
     temperature: Option<f32>,
     max_output_tokens: Option<u32>,
     reasoning: Option<bool>,
+    max_context_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -318,6 +389,8 @@ struct FileAgent {
     approval: Option<String>,
     stalled_recovery: Option<String>,
     stalled_max_recovery: Option<u32>,
+    auto_continue: Option<bool>,
+    max_total_turns: Option<u32>,
     commands: Option<FileCommandRules>,
     skills: Option<String>,
     profiles: Option<std::collections::BTreeMap<String, FileProfile>>,
@@ -385,6 +458,7 @@ struct FileOutput {
     no_stream: Option<bool>,
     color: Option<bool>,
     debug_trace: Option<bool>,
+    theme: Option<String>,
 }
 
 fn config_error(message: impl Into<String>) -> XduduError {
@@ -595,6 +669,13 @@ fn apply_file(
         sources,
     );
     set(
+        &mut config.provider.max_context_tokens,
+        &file.provider.max_context_tokens,
+        "provider.max_context_tokens",
+        source,
+        sources,
+    );
+    set(
         &mut config.agent.max_turns,
         &file.agent.max_turns,
         "agent.max_turns",
@@ -633,6 +714,20 @@ fn apply_file(
         &mut config.agent.skills,
         &file.agent.skills,
         "agent.skills",
+        source,
+        sources,
+    );
+    set(
+        &mut config.agent.auto_continue,
+        &file.agent.auto_continue,
+        "agent.auto_continue",
+        source,
+        sources,
+    );
+    set(
+        &mut config.agent.max_total_turns,
+        &file.agent.max_total_turns,
+        "agent.max_total_turns",
         source,
         sources,
     );
@@ -688,6 +783,13 @@ fn apply_file(
         &mut config.output.debug_trace,
         &file.output.debug_trace,
         "output.debug_trace",
+        source,
+        sources,
+    );
+    set(
+        &mut config.output.theme,
+        &file.output.theme,
+        "output.theme",
         source,
         sources,
     );
@@ -848,6 +950,8 @@ fn env_file(provider: &str) -> FileConfig {
                 .and_then(|value| value.parse().ok()),
             reasoning: value("XDUDU_REASONING", "XYCLI_REASONING")
                 .and_then(|value| value.parse().ok()),
+            max_context_tokens: value("XDUDU_MAX_CONTEXT_TOKENS", "XYCLI_MAX_CONTEXT_TOKENS")
+                .and_then(|value| value.parse().ok()),
         },
         agent: FileAgent {
             max_turns: value("XDUDU_MAX_TURNS", "XYCLI_MAX_TURNS")
@@ -859,6 +963,10 @@ fn env_file(provider: &str) -> FileConfig {
                 .and_then(|value| value.parse().ok()),
             commands: None,
             skills: value("XDUDU_SKILLS", "XYCLI_SKILLS"),
+            auto_continue: value("XDUDU_AUTO_CONTINUE", "XYCLI_AUTO_CONTINUE")
+                .and_then(|value| value.parse().ok()),
+            max_total_turns: value("XDUDU_MAX_TOTAL_TURNS", "XYCLI_MAX_TOTAL_TURNS")
+                .and_then(|value| value.parse().ok()),
             profiles: None,
         },
         output: FileOutput {
@@ -868,6 +976,7 @@ fn env_file(provider: &str) -> FileConfig {
             color: env::var("NO_COLOR").ok().map(|_| false),
             debug_trace: value("XDUDU_DEBUG_TRACE", "XYCLI_DEBUG_TRACE")
                 .and_then(|value| value.parse().ok()),
+            theme: value("XDUDU_THEME", "XYCLI_THEME"),
         },
         telemetry: FileTelemetry {
             enabled: value("XDUDU_TELEMETRY_ENABLED", "XYCLI_TELEMETRY_ENABLED")
@@ -1019,8 +1128,9 @@ fn load_config_from_paths(
             retry_base_ms: 500,
             min_request_interval_ms: 0,
             temperature: 0.2,
-            max_output_tokens: 4096,
+            max_output_tokens: 8192,
             reasoning: false,
+            max_context_tokens: 0,
         },
         agent: AgentConfig::default(),
         output: OutputConfig {
@@ -1028,6 +1138,7 @@ fn load_config_from_paths(
             no_stream: false,
             color: env::var_os("NO_COLOR").is_none(),
             debug_trace: false,
+            theme: "auto".into(),
         },
         telemetry: TelemetryConfig { enabled: false },
         memory: MemoryConfig {
@@ -1047,6 +1158,7 @@ fn load_config_from_paths(
         ("provider.temperature", ConfigSource::Default),
         ("provider.max_output_tokens", ConfigSource::Default),
         ("provider.reasoning", ConfigSource::Default),
+        ("provider.max_context_tokens", ConfigSource::Default),
         ("agent.max_turns", ConfigSource::Default),
         ("agent.permission", ConfigSource::Default),
         ("agent.approval", ConfigSource::Default),
@@ -1056,11 +1168,14 @@ fn load_config_from_paths(
         ("agent.commands.ask", ConfigSource::Default),
         ("agent.commands.deny", ConfigSource::Default),
         ("agent.skills", ConfigSource::Default),
+        ("agent.auto_continue", ConfigSource::Default),
+        ("agent.max_total_turns", ConfigSource::Default),
         ("agent.profiles", ConfigSource::Default),
         ("output.json", ConfigSource::Default),
         ("output.no_stream", ConfigSource::Default),
         ("output.color", ConfigSource::Default),
         ("output.debug_trace", ConfigSource::Default),
+        ("output.theme", ConfigSource::Default),
         ("telemetry.enabled", ConfigSource::Default),
         ("memory.suggest_enabled", ConfigSource::Default),
         ("memory.top_k", ConfigSource::Default),
@@ -1099,6 +1214,7 @@ fn load_config_from_paths(
             temperature: overrides.temperature,
             max_output_tokens: overrides.max_output_tokens,
             reasoning: overrides.reasoning,
+            max_context_tokens: None,
         },
         agent: FileAgent {
             max_turns: overrides.max_turns,
@@ -1106,6 +1222,8 @@ fn load_config_from_paths(
             approval: overrides.approval,
             stalled_recovery: overrides.stalled_recovery,
             stalled_max_recovery: overrides.stalled_max_recovery,
+            auto_continue: None,
+            max_total_turns: None,
             commands: None,
             skills: None,
             profiles: None,
@@ -1115,6 +1233,7 @@ fn load_config_from_paths(
             no_stream: overrides.no_stream,
             color: overrides.color,
             debug_trace: overrides.debug_trace,
+            theme: None,
         },
         telemetry: FileTelemetry {
             enabled: overrides.telemetry_enabled,
@@ -1191,16 +1310,20 @@ pub fn write_config_value(
                 | "provider.temperature"
                 | "provider.max_output_tokens"
                 | "provider.reasoning"
+                | "provider.max_context_tokens"
                 | "agent.max_turns"
                 | "agent.permission"
                 | "agent.approval"
                 | "agent.stalled_recovery"
                 | "agent.stalled_max_recovery"
                 | "agent.skills"
+                | "agent.auto_continue"
+                | "agent.max_total_turns"
                 | "output.json"
                 | "output.no_stream"
                 | "output.color"
                 | "output.debug_trace"
+                | "output.theme"
                 | "telemetry.enabled"
                 | "memory.suggest_enabled"
                 | "memory.top_k"
@@ -1248,8 +1371,10 @@ pub fn write_config_value(
             | "provider.retry_base_ms"
             | "provider.min_request_interval_ms"
             | "provider.max_output_tokens"
+            | "provider.max_context_tokens"
             | "agent.max_turns"
             | "agent.stalled_max_recovery"
+            | "agent.max_total_turns"
             | "memory.top_k"
             | "memory.injection_token_budget"
     ) {
@@ -1263,7 +1388,9 @@ pub fn write_config_value(
             "provider.retry_base_ms" => (10..=30_000).contains(&number),
             "provider.min_request_interval_ms" => (0..=60_000).contains(&number),
             "provider.max_output_tokens" => (1..=32_768).contains(&number),
+            "provider.max_context_tokens" => (16_384..=1_048_576).contains(&number),
             "agent.stalled_max_recovery" => (1..=10).contains(&number),
+            "agent.max_total_turns" => (1..=1_000).contains(&number),
             "memory.top_k" => (1..=32).contains(&number),
             "memory.injection_token_budget" => (128..=8192).contains(&number),
             _ => false,
@@ -1289,6 +1416,7 @@ pub fn write_config_value(
     } else if key.starts_with("output.")
         || key == "telemetry.enabled"
         || key == "memory.suggest_enabled"
+        || key == "agent.auto_continue"
     {
         Value::Boolean(
             raw_value
@@ -1500,5 +1628,111 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn 上下文预算按模型窗口推导() {
+        // deepseek 128K → 预算 96K（窗口的 3/4）。
+        let deepseek = ProviderConfig {
+            name: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            max_context_tokens: 0,
+            ..ProviderConfig::default()
+        };
+        assert_eq!(deepseek.context_budget().unwrap(), 96_000);
+        // anthropic claude 200K → 预算 150K。
+        let claude = ProviderConfig {
+            name: "anthropic".into(),
+            model: "claude-sonnet-4-5".into(),
+            max_context_tokens: 0,
+            ..ProviderConfig::default()
+        };
+        assert_eq!(claude.context_budget().unwrap(), 150_000);
+        // openai-compatible 未知模型 → 保守 64K → 预算 48K。
+        let custom = ProviderConfig {
+            name: "openai-compatible".into(),
+            model: "my-model".into(),
+            max_context_tokens: 0,
+            ..ProviderConfig::default()
+        };
+        assert_eq!(custom.context_budget().unwrap(), 48_000);
+        // 显式能力声明覆盖内置表。
+        let overridden = ProviderConfig {
+            name: "openai-compatible".into(),
+            model: "my-model".into(),
+            max_context_tokens: 200_000,
+            ..ProviderConfig::default()
+        };
+        assert_eq!(overridden.context_budget().unwrap(), 150_000);
+        // 非法窗口拒绝。
+        let invalid = ProviderConfig {
+            name: "openai-compatible".into(),
+            model: "x".into(),
+            max_context_tokens: 1_000,
+            ..ProviderConfig::default()
+        };
+        assert!(invalid.context_budget().is_err());
+    }
+
+    #[test]
+    fn max_total_turns_默认值与范围校验() {
+        assert_eq!(AgentConfig::default().max_total_turns, 200);
+        assert!(AgentConfig::default().auto_continue);
+        let mut agent = AgentConfig::default();
+        assert_eq!(agent.max_total_turns().unwrap(), 200);
+        agent.max_total_turns = 1_000;
+        assert_eq!(agent.max_total_turns().unwrap(), 1_000);
+        for invalid in [0, 1_001] {
+            agent.max_total_turns = invalid;
+            assert!(agent.max_total_turns().is_err(), "预算 {invalid} 应被拒绝");
+        }
+    }
+
+    #[test]
+    fn auto_continue与max_total_turns_支持配置文件与写白名单() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".xdudu")).unwrap();
+        fs::write(
+            root.path().join(".xdudu/config.toml"),
+            "[agent]\nauto_continue = false\nmax_total_turns = 80\n",
+        )
+        .unwrap();
+        let resolved = load_config(root.path(), ConfigOverrides::default()).unwrap();
+        assert!(!resolved.config.agent.auto_continue);
+        assert_eq!(resolved.config.agent.max_total_turns, 80);
+        assert_eq!(
+            resolved.sources.get("agent.auto_continue"),
+            Some(&ConfigSource::Project)
+        );
+        write_config_value(root.path(), false, "agent.auto_continue", "true").unwrap();
+        write_config_value(root.path(), false, "agent.max_total_turns", "300").unwrap();
+        let resolved = load_config(root.path(), ConfigOverrides::default()).unwrap();
+        assert!(resolved.config.agent.auto_continue);
+        assert_eq!(resolved.config.agent.max_total_turns, 300);
+        assert!(write_config_value(root.path(), false, "agent.max_total_turns", "1001").is_err());
+        assert!(write_config_value(root.path(), false, "agent.auto_continue", "maybe").is_err());
+    }
+
+    #[test]
+    fn max_context_tokens_支持配置文件与写白名单() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".xdudu")).unwrap();
+        fs::write(
+            root.path().join(".xdudu/config.toml"),
+            "[provider]\nmax_context_tokens = 200000\n",
+        )
+        .unwrap();
+        let resolved = load_config(root.path(), ConfigOverrides::default()).unwrap();
+        assert_eq!(resolved.config.provider.max_context_tokens, 200_000);
+        assert_eq!(
+            resolved.sources.get("provider.max_context_tokens"),
+            Some(&ConfigSource::Project)
+        );
+        write_config_value(root.path(), false, "provider.max_context_tokens", "128000").unwrap();
+        let resolved = load_config(root.path(), ConfigOverrides::default()).unwrap();
+        assert_eq!(resolved.config.provider.max_context_tokens, 128_000);
+        assert!(
+            write_config_value(root.path(), false, "provider.max_context_tokens", "100").is_err()
+        );
     }
 }

@@ -8,3 +8,8 @@ target/
 docs/LEARNING_GUIDE.md
 docs/M5_TECHNICAL_IMPLEMENTATION.md
 .claude/
+
+# Codex CLI 参考仓库缓存
+.codex-ref/
+# 本地分析产物
+output/

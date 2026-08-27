@@ -172,6 +172,19 @@ impl EventSink for ConsoleRenderer {
             AgentEvent::Warning { message, .. } => {
                 eprintln!("  {} {}", theme.warning("⚠ 警告"), redact_text(&message));
             }
+            AgentEvent::Continuing { note, .. } => {
+                eprintln!("  {} {}", theme.accent("↻"), redact_text(&note));
+            }
+            AgentEvent::CompactionApplied {
+                layer,
+                saved_tokens,
+            } => {
+                eprintln!(
+                    "  {} 上下文压缩（{layer}）：节省约 {saved_tokens} tokens",
+                    theme.accent("↻")
+                );
+            }
+            AgentEvent::ReasoningDelta { .. } => {}
             AgentEvent::PlanStarted { revision, .. } => {
                 eprintln!("  {} 开始执行计划 revision {revision}", theme.accent("◆"));
             }

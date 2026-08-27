@@ -426,6 +426,12 @@ struct Runtime {
     provider_display: String,
     model: String,
     max_turns: u32,
+    /// 上下文输入 Token 预算（估算值），超出触发分级压缩。
+    context_budget: usize,
+    /// 段轮次预算用尽时是否自动续跑。
+    auto_continue: bool,
+    /// 总轮次预算硬上限（所有续跑段累计）。
+    max_total_turns: u32,
     cwd: PathBuf,
     permission_mode: PermissionMode,
     /// 运行中可变的共享权限模式（Shift+Tab 切换即时生效）。
@@ -439,6 +445,8 @@ struct Runtime {
     renderer: ConsoleRenderer,
     stream: bool,
     color: bool,
+    /// TUI 配色主题：dark | light | auto。
+    theme: String,
     debug_trace: bool,
     startup_notices: Vec<String>,
     /// TUI 会话共享输入路由；非 TUI 模式保持未激活。
@@ -666,6 +674,9 @@ async fn create_runtime(
         provider_display: provider_label(&resolved.config.provider.name),
         model: resolved.config.provider.model.clone(),
         max_turns: resolved.config.agent.max_turns,
+        context_budget: resolved.config.provider.context_budget()?,
+        auto_continue: resolved.config.agent.auto_continue,
+        max_total_turns: resolved.config.agent.max_total_turns()?,
         cwd: cwd.clone(),
         permission_mode: resolved.config.agent.permission_mode()?,
         shared_permission: Arc::new(std::sync::Mutex::new(
@@ -683,6 +694,7 @@ async fn create_runtime(
         ),
         stream: !resolved.config.output.no_stream,
         color,
+        theme: resolved.config.output.theme.clone(),
         debug_trace: resolved.config.output.debug_trace,
         startup_notices: mcp
             .failures
@@ -761,6 +773,8 @@ async fn execute_prompt_with_cancellation(
         prompt,
         model: runtime.model.clone(),
         max_turns: runtime.max_turns,
+        auto_continue: runtime.auto_continue,
+        max_total_turns: runtime.max_total_turns,
         cwd: runtime.cwd.clone(),
         provider: runtime.provider.as_ref(),
         tool_registry: &runtime.registry,
@@ -776,9 +790,11 @@ async fn execute_prompt_with_cancellation(
         reasoning: runtime.reasoning,
         stalled_recovery: runtime.stalled_recovery,
         stalled_max_recovery: runtime.stalled_max_recovery,
+        context_budget: runtime.context_budget,
         skills: runtime.skills.clone(),
         force_compact: Arc::clone(&runtime.force_compact),
         profiles: runtime.profiles.clone(),
+        injections: None,
     })
     .await
 }
@@ -951,6 +967,7 @@ async fn tui_interactive_loop(
         skills,
         color: runtime.color,
         debug_trace: runtime.debug_trace,
+        theme: runtime.theme.clone(),
     };
     let router = Arc::clone(&runtime.input_router);
     let (app, _screen) = TuiApp::enter(context, Arc::clone(&router)).map_err(XduduError::from)?;
@@ -1007,6 +1024,7 @@ async fn tui_interactive_loop(
     let mut pending: VecDeque<String> = VecDeque::new();
     let mut run_future: Option<RunFuture> = None;
     let mut run_cancel: Option<CancellationToken> = None;
+    let mut run_inject: Option<tokio::sync::mpsc::UnboundedSender<String>> = None;
     if let Some(prompt) = initial_prompt {
         start_tui_run(
             &app,
@@ -1016,6 +1034,7 @@ async fn tui_interactive_loop(
             session_id,
             &mut run_future,
             &mut run_cancel,
+            &mut run_inject,
         )
         .await?;
     }
@@ -1028,6 +1047,7 @@ async fn tui_interactive_loop(
                     match event {
                         Some(event) => TuiSelect::Event(handle_tui_running_event(
                             &app, event, &mut pending, run_cancel.as_ref(),
+                            run_inject.as_ref(),
                         ).await?),
                         None => {
                             if let Some(cancel) = run_cancel.as_ref() {
@@ -1043,6 +1063,7 @@ async fn tui_interactive_loop(
                     let result = result?;
                     run_future = None;
                     run_cancel = None;
+                    run_inject = None;
                     app.finish_prompt(&result).map_err(XduduError::from)?;
                     session_id = Some(result.session_id);
                     // 任务完成后由模型自主判断是否存在值得长期保留的信息；
@@ -1066,6 +1087,7 @@ async fn tui_interactive_loop(
                     &mut session_id,
                     &mut run_future,
                     &mut run_cancel,
+                    &mut run_inject,
                 )
                 .await?
                 {
@@ -1089,6 +1111,7 @@ async fn tui_interactive_loop(
                     &mut session_id,
                     &mut run_future,
                     &mut run_cancel,
+                    &mut run_inject,
                 )
                 .await?
                 {
@@ -1108,6 +1131,7 @@ async fn tui_interactive_loop(
                 &mut session_id,
                 &mut run_future,
                 &mut run_cancel,
+                &mut run_inject,
             )
             .await?
             {
@@ -1135,12 +1159,14 @@ enum TuiSelect {
     Event(TuiLoopAction),
 }
 
-/// 运行中的事件处理：Ctrl+C 取消当前任务，Enter 排队，其余按键编辑 Composer。
+/// 运行中的事件处理：Ctrl+C 取消当前任务；普通提示注入当前任务下一轮，
+/// 斜杠命令排队等任务结束后执行；其余按键编辑 Composer。
 async fn handle_tui_running_event(
     app: &TuiApp,
     event: Event,
     pending: &mut VecDeque<String>,
     run_cancel: Option<&CancellationToken>,
+    run_inject: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> Result<TuiLoopAction, XduduError> {
     match event {
         Event::Paste(text) => {
@@ -1167,9 +1193,27 @@ async fn handle_tui_running_event(
                 return Ok(TuiLoopAction::Continue);
             }
             match app.handle_key(key).map_err(XduduError::from)? {
-                Some(InputOutcome::Submit(line) | InputOutcome::Command(line)) => {
+                Some(InputOutcome::Submit(line)) => {
+                    // 普通提示：注入当前任务的下一轮，立即在历史区可见。
+                    if let Some(inject) = run_inject {
+                        app.inject_prompt(&line).map_err(XduduError::from)?;
+                        let _ = inject.send(line);
+                        app.notice("已并入当前任务：将在下一轮送达模型。")
+                            .map_err(XduduError::from)?;
+                    } else {
+                        pending.push_back(line);
+                        app.notice("已排队，当前任务结束后自动执行。")
+                            .map_err(XduduError::from)?;
+                    }
+                }
+                Some(InputOutcome::Command(line)) => {
                     pending.push_back(line);
                     app.notice("已排队，当前任务结束后自动执行。")
+                        .map_err(XduduError::from)?;
+                }
+                Some(InputOutcome::ToggleFold) => {
+                    app.renderer()
+                        .toggle_last_group()
                         .map_err(XduduError::from)?;
                 }
                 Some(InputOutcome::Interrupted | InputOutcome::Exit) | None => {}
@@ -1181,6 +1225,7 @@ async fn handle_tui_running_event(
 }
 
 /// 空闲事件处理：正常 Composer 交互，提交后启动任务或执行命令。
+#[allow(clippy::too_many_arguments)]
 async fn handle_tui_idle_event(
     app: &TuiApp,
     runtime: &mut Runtime,
@@ -1189,6 +1234,7 @@ async fn handle_tui_idle_event(
     session_id: &mut Option<Uuid>,
     run_future: &mut Option<RunFuture>,
     run_cancel: &mut Option<CancellationToken>,
+    run_inject: &mut Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> Result<TuiLoopAction, XduduError> {
     match event {
         Event::Paste(text) => {
@@ -1216,6 +1262,7 @@ async fn handle_tui_idle_event(
                         *session_id,
                         run_future,
                         run_cancel,
+                        run_inject,
                     )
                     .await?;
                 }
@@ -1224,6 +1271,11 @@ async fn handle_tui_idle_event(
                 }
                 Some(InputOutcome::Interrupted) => {
                     app.notice("再次按 Ctrl+D 或输入 /exit 可退出。")
+                        .map_err(XduduError::from)?;
+                }
+                Some(InputOutcome::ToggleFold) => {
+                    app.renderer()
+                        .toggle_last_group()
                         .map_err(XduduError::from)?;
                 }
                 Some(InputOutcome::Exit) => return Ok(TuiLoopAction::Exit),
@@ -1289,6 +1341,7 @@ fn is_backtab(key: &KeyEvent) -> bool {
 }
 
 /// 排队输入：命令直接执行，普通提示启动新任务。
+#[allow(clippy::too_many_arguments)]
 async fn handle_queued_tui_input(
     app: &TuiApp,
     runtime: &mut Runtime,
@@ -1297,6 +1350,7 @@ async fn handle_queued_tui_input(
     session_id: &mut Option<Uuid>,
     run_future: &mut Option<RunFuture>,
     run_cancel: &mut Option<CancellationToken>,
+    run_inject: &mut Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> Result<TuiLoopAction, XduduError> {
     if input.trim_start().starts_with('/') {
         handle_tui_command(app, runtime, renderer, input.trim(), session_id).await
@@ -1309,6 +1363,7 @@ async fn handle_queued_tui_input(
             *session_id,
             run_future,
             run_cancel,
+            run_inject,
         )
         .await?;
         Ok(TuiLoopAction::Continue)
@@ -1319,6 +1374,7 @@ async fn handle_queued_tui_input(
 ///
 /// Future 通过克隆捕获运行所需的全部片段，不借用 `runtime`，因此任务
 /// 运行期间 `/model`、`/turns` 等命令仍可修改运行时配置。
+#[allow(clippy::too_many_arguments)]
 async fn start_tui_run(
     app: &TuiApp,
     runtime: &Runtime,
@@ -1327,9 +1383,12 @@ async fn start_tui_run(
     session_id: Option<Uuid>,
     run_future: &mut Option<RunFuture>,
     run_cancel: &mut Option<CancellationToken>,
+    run_inject: &mut Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> Result<(), XduduError> {
     app.begin_prompt(&prompt).map_err(XduduError::from)?;
     let cancellation = CancellationToken::new();
+    let (inject_tx, inject_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    *run_inject = Some(inject_tx);
     let provider = Arc::clone(&runtime.provider);
     let registry = runtime.registry.clone();
     let store = Arc::clone(&runtime.store);
@@ -1345,6 +1404,9 @@ async fn start_tui_run(
     let reasoning = runtime.reasoning;
     let stalled_recovery = runtime.stalled_recovery;
     let stalled_max_recovery = runtime.stalled_max_recovery;
+    let context_budget = runtime.context_budget;
+    let auto_continue = runtime.auto_continue;
+    let max_total_turns = runtime.max_total_turns;
     let skills = runtime.skills.clone();
     let force_compact = Arc::clone(&runtime.force_compact);
     let profiles = runtime.profiles.clone();
@@ -1354,6 +1416,8 @@ async fn start_tui_run(
             prompt,
             model,
             max_turns,
+            auto_continue,
+            max_total_turns,
             cwd,
             provider: provider.as_ref(),
             tool_registry: &registry,
@@ -1369,9 +1433,11 @@ async fn start_tui_run(
             reasoning,
             stalled_recovery,
             stalled_max_recovery,
+            context_budget,
             skills,
             force_compact,
             profiles,
+            injections: Some(inject_rx),
         })
         .await
     });
@@ -1469,6 +1535,11 @@ async fn read_line_in_tui(app: &TuiApp) -> Result<Option<String>, XduduError> {
             match app.handle_key(key).map_err(XduduError::from)? {
                 Some(InputOutcome::Submit(value)) | Some(InputOutcome::Command(value)) => {
                     return Ok(Some(value));
+                }
+                Some(InputOutcome::ToggleFold) => {
+                    app.renderer()
+                        .toggle_last_group()
+                        .map_err(XduduError::from)?;
                 }
                 Some(InputOutcome::Interrupted) | Some(InputOutcome::Exit) => return Ok(None),
                 None => {}
