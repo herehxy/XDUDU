@@ -98,14 +98,14 @@ impl ProviderConfig {
         Ok(window)
     }
 
-    /// 软阈值（对齐 Codex auto_compact_token_limit）：窗口的 90%，超出触发
-    /// 自动上下文压缩；`max_context_tokens` 显式设置时基于该窗口计算。
+    /// 软阈值（对齐 Codex auto_compact_token_limit）：窗口的 90%，真实用量
+    /// 达到即触发自动上下文压缩；`max_context_tokens` 显式设置时基于该窗口计算。
     pub fn context_budget(&self) -> XduduResult<usize> {
         Ok((self.context_window()? * 9 / 10).max(8_000))
     }
 
     /// 硬顶（对齐 Codex effective_context_window_percent）：窗口的 95%，
-    /// 真实用量超过时必须强制压缩，防止突破模型上下文窗口。
+    /// 真实用量达到时在 L3 之外强制 L2 确定性截断，防止突破模型上下文窗口。
     pub fn context_hard_limit(&self) -> XduduResult<usize> {
         Ok((self.context_window()? * 95 / 100).max(8_000))
     }

@@ -426,9 +426,9 @@ struct Runtime {
     provider_display: String,
     model: String,
     max_turns: u32,
-    /// 上下文软阈值（窗口×90%）：超出触发自动压缩。
+    /// 上下文软阈值（窗口×90%）：真实用量达到即触发自动压缩。
     context_budget: usize,
-    /// 上下文硬顶（窗口×95%）：真实用量超过时强制压缩。
+    /// 上下文硬顶（窗口×95%）：真实用量达到时强制确定性截断。
     context_hard_limit: usize,
     /// 段轮次预算用尽时是否自动续跑。
     auto_continue: bool,
