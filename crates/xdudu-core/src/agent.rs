@@ -86,9 +86,10 @@ pub struct AgentRunConfig<'a> {
     pub stalled_recovery: StalledRecoveryMode,
     /// 停滞恢复模式下允许的最大恢复尝试次数。
     pub stalled_max_recovery: u32,
-    /// 上下文输入 Token 预算（估算值）：超过触发确定性截断，达到 2× 触发
-    /// LLM 结构化压缩。大型审查/研究任务可调大以减少压缩频率。
+    /// 上下文软阈值（估算值，窗口×90%）：超过触发自动压缩。
     pub context_budget: usize,
+    /// 上下文硬顶（窗口×95%）：真实用量超过时强制压缩，防止突破模型窗口。
+    pub context_hard_limit: usize,
     /// 可用技能索引（`skill` 工具加载后正文注入当前轮系统提示词）。
     pub skills: Vec<Skill>,
     /// 强制压缩标志：CLI `/compact` 置位后，下一轮请求前触发一次上下文压缩。
@@ -378,8 +379,10 @@ struct CompactContext<'a> {
     max_output_tokens: u32,
     reasoning: bool,
     cancellation: CancellationToken,
-    /// 上下文 Token 预算（估算值，来自 agent.context_budget 配置）。
+    /// 上下文 Token 预算（估算值，来自模型窗口×90%）。
     budget: usize,
+    /// 上下文硬顶（模型窗口×95%）：真实用量超过时强制压缩。
+    hard_limit: usize,
     force: bool,
     /// 最近一轮 Provider 返回的真实输入 Token：优先于估算值作为触发依据。
     real_input_tokens: Option<u64>,
@@ -403,6 +406,7 @@ async fn compact_context(ctx: CompactContext<'_>) -> CompactOutcome {
         reasoning,
         cancellation,
         budget,
+        hard_limit,
         force,
         real_input_tokens,
         event_sink,
@@ -419,11 +423,15 @@ async fn compact_context(ctx: CompactContext<'_>) -> CompactOutcome {
     // 投影后估算：实际发给模型的请求大小。
     let current_tokens = provider_message_tokens(&assemble_provider_messages(session, budget))
         .saturating_add(fixed_tokens);
-    // 真实用量优先：上一轮 Provider 返回的真实输入 Token 超预算即触发，
-    // 不再依赖字符估算；估算值仅作无真实用量时的冷启动判据。
-    let real_over_budget = real_input_tokens
-        .is_some_and(|tokens| usize::try_from(tokens).unwrap_or(usize::MAX) > budget);
-    if !force && !real_over_budget && current_tokens <= budget && baseline_tokens <= budget {
+    // 软/硬双阈值分层（对齐 Codex auto_compact 语义）：
+    // - 软阈值（窗口×90%）：L1 投影是常态消化机制，只要投影后的请求估算
+    //   仍在预算内就不打扰（无 LLM/截断压缩），真实基线可以超过软阈值；
+    // - 硬顶（窗口×95%）：上一轮 Provider 返回的真实输入 Token 超过硬顶，
+    //   或投影后估算仍超预算（投影消化不了）时，才触发 L3 LLM 压缩与
+    //   L2 确定性截断。
+    let real_over_hard = real_input_tokens
+        .is_some_and(|tokens| usize::try_from(tokens).unwrap_or(usize::MAX) > hard_limit);
+    if !force && !real_over_hard && current_tokens <= budget {
         return CompactOutcome::None;
     }
     // 超预算（或强制）优先尝试 LLM 交接摘要（分级翻转：不再先做粗暴截断，
@@ -464,7 +472,7 @@ async fn compact_context(ctx: CompactContext<'_>) -> CompactOutcome {
         system,
         tools_json,
         budget,
-        baseline_tokens > budget || real_over_budget,
+        baseline_tokens > budget || real_over_hard,
     ) {
         if llm_attempted {
             CompactOutcome::LlmFallback
@@ -1224,6 +1232,7 @@ pub async fn run_agent(mut config: AgentRunConfig<'_>) -> XduduResult<AgentRunRe
             reasoning: config.reasoning,
             cancellation: config.cancellation.child_token(),
             budget: config.context_budget,
+            hard_limit: config.context_hard_limit,
             force: force_compact,
             real_input_tokens: last_input_tokens,
             event_sink: config.event_sink,
@@ -2030,6 +2039,7 @@ mod tests {
             stalled_recovery: StalledRecoveryMode::Auto,
             stalled_max_recovery: 3,
             context_budget: 24_000,
+            context_hard_limit: 25_000,
             skills: Vec::new(),
             force_compact: Arc::new(AtomicBool::new(false)),
             profiles: crate::subagent::builtin_profiles(),
@@ -2583,6 +2593,7 @@ mod tests {
                 stalled_recovery: StalledRecoveryMode::Auto,
                 stalled_max_recovery: 3,
                 context_budget: 24_000,
+                context_hard_limit: 25_000,
                 skills: Vec::new(),
                 force_compact: Arc::new(AtomicBool::new(false)),
                 profiles: crate::subagent::builtin_profiles(),
@@ -2691,6 +2702,7 @@ mod tests {
             reasoning: false,
             cancellation: CancellationToken::new(),
             budget: 24_000,
+            hard_limit: 25_000,
             force: false,
             real_input_tokens: None,
             event_sink: None,
@@ -2782,6 +2794,7 @@ mod tests {
             reasoning: false,
             cancellation: CancellationToken::new(),
             budget: 24_000,
+            hard_limit: 25_000,
             force: false,
             real_input_tokens: None,
             event_sink: None,
@@ -2853,6 +2866,7 @@ mod tests {
             reasoning: false,
             cancellation: CancellationToken::new(),
             budget: 24_000,
+            hard_limit: 25_000,
             force: false,
             real_input_tokens: None,
             event_sink: None,
@@ -3089,7 +3103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 投影未超预算但真实基线超预算仍触发压缩() {
+    async fn 软阈值下投影可消化时不再触发压缩() {
         let dir = tempdir().unwrap();
         let now = Utc::now();
         let big = "工具输出内容".repeat(400);
@@ -3144,7 +3158,8 @@ mod tests {
             updated_at: now,
             completed_at: None,
         };
-        // 预算取在“投影后估算”与“真实基线”之间：旧实现只看投影会认为无需压缩。
+        // 预算取在“投影后估算”与“真实基线”之间：软阈值下投影是常态消化
+        // 机制，投影后的请求仍在预算内即不打扰（无 LLM/截断压缩）。
         let budget = 7_000;
         let fixed_tokens = estimated_tokens("系统约束")
             .saturating_add(estimated_tokens("[]"))
@@ -3165,8 +3180,89 @@ mod tests {
             reasoning: false,
             cancellation: CancellationToken::new(),
             budget,
+            hard_limit: budget * 2,
             force: false,
             real_input_tokens: None,
+            event_sink: None,
+        })
+        .await;
+        // 软阈值分层：真实基线虽超预算，但投影后请求在预算内 → 无打扰。
+        assert!(matches!(outcome, CompactOutcome::None));
+        assert_eq!(session.summarized_message_count, 0);
+    }
+
+    #[tokio::test]
+    async fn 真实用量超过硬顶时强制压缩并保留审查进度索引() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let big = "工具输出内容".repeat(400);
+        let mut messages = Vec::new();
+        let mut records = Vec::new();
+        for index in 0..6 {
+            let call_id = format!("call-{index}");
+            messages.push(new_message(
+                MessageRole::User,
+                format!("请求 {index}"),
+                messages.len(),
+            ));
+            let mut assistant = new_message(MessageRole::Assistant, String::new(), messages.len());
+            assistant.tool_calls.push(ToolCall {
+                id: call_id.clone(),
+                name: "file_read".into(),
+                input: json!({"path": format!("file{index}.txt")}),
+            });
+            messages.push(assistant);
+            let mut tool = new_message(MessageRole::Tool, big.clone(), messages.len());
+            tool.tool_call_id = Some(call_id.clone());
+            messages.push(tool);
+            records.push(ToolCallRecord {
+                id: call_id,
+                tool_name: "file_read".into(),
+                input: json!({"path": format!("file{index}.txt")}),
+                output: None,
+                error: None,
+                status: ToolCallStatus::Succeeded,
+                duration_ms: Some(1),
+                started_at: now,
+                ended_at: Some(now),
+                approval: None,
+            });
+        }
+        let mut session = Session {
+            id: Uuid::new_v4(),
+            title: "硬顶触发".into(),
+            cwd: dir.path().to_path_buf(),
+            status: SessionStatus::Running,
+            current_state: AgentLoopState::Planning,
+            plan: Value::Null,
+            provider_name: "mock".into(),
+            model: "test".into(),
+            messages,
+            tool_calls: records,
+            context_summary: String::new(),
+            summarized_message_count: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        // 真实用量超过硬顶（窗口×95%）：即使投影后估算在预算内也强制压缩。
+        let budget = 7_000;
+        let outcome = compact_context(CompactContext {
+            session: &mut session,
+            system: "系统约束",
+            tools_json: "[]",
+            provider: None,
+            model: "test",
+            temperature: 0.2,
+            max_output_tokens: 4096,
+            reasoning: false,
+            cancellation: CancellationToken::new(),
+            budget,
+            hard_limit: budget * 2,
+            force: false,
+            real_input_tokens: Some((budget * 2 + 1) as u64),
             event_sink: None,
         })
         .await;
@@ -3342,6 +3438,7 @@ mod tests {
             reasoning: false,
             cancellation: CancellationToken::new(),
             budget: 24_000,
+            hard_limit: 25_000,
             force: false,
             real_input_tokens: None,
             event_sink: None,
@@ -3457,6 +3554,7 @@ mod tests {
             stalled_recovery: StalledRecoveryMode::Auto,
             stalled_max_recovery,
             context_budget: 24_000,
+            context_hard_limit: 25_000,
             skills: Vec::new(),
             force_compact: Arc::new(AtomicBool::new(false)),
             profiles: crate::subagent::builtin_profiles(),

@@ -426,8 +426,10 @@ struct Runtime {
     provider_display: String,
     model: String,
     max_turns: u32,
-    /// 上下文输入 Token 预算（估算值），超出触发分级压缩。
+    /// 上下文软阈值（窗口×90%）：超出触发自动压缩。
     context_budget: usize,
+    /// 上下文硬顶（窗口×95%）：真实用量超过时强制压缩。
+    context_hard_limit: usize,
     /// 段轮次预算用尽时是否自动续跑。
     auto_continue: bool,
     /// 总轮次预算硬上限（所有续跑段累计）。
@@ -675,6 +677,7 @@ async fn create_runtime(
         model: resolved.config.provider.model.clone(),
         max_turns: resolved.config.agent.max_turns,
         context_budget: resolved.config.provider.context_budget()?,
+        context_hard_limit: resolved.config.provider.context_hard_limit()?,
         auto_continue: resolved.config.agent.auto_continue,
         max_total_turns: resolved.config.agent.max_total_turns()?,
         cwd: cwd.clone(),
@@ -791,6 +794,7 @@ async fn execute_prompt_with_cancellation(
         stalled_recovery: runtime.stalled_recovery,
         stalled_max_recovery: runtime.stalled_max_recovery,
         context_budget: runtime.context_budget,
+        context_hard_limit: runtime.context_hard_limit,
         skills: runtime.skills.clone(),
         force_compact: Arc::clone(&runtime.force_compact),
         profiles: runtime.profiles.clone(),
@@ -1405,6 +1409,7 @@ async fn start_tui_run(
     let stalled_recovery = runtime.stalled_recovery;
     let stalled_max_recovery = runtime.stalled_max_recovery;
     let context_budget = runtime.context_budget;
+    let context_hard_limit = runtime.context_hard_limit;
     let auto_continue = runtime.auto_continue;
     let max_total_turns = runtime.max_total_turns;
     let skills = runtime.skills.clone();
@@ -1434,6 +1439,7 @@ async fn start_tui_run(
             stalled_recovery,
             stalled_max_recovery,
             context_budget,
+            context_hard_limit,
             skills,
             force_compact,
             profiles,

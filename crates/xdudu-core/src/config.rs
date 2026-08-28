@@ -83,9 +83,8 @@ impl Default for ProviderConfig {
 }
 
 impl ProviderConfig {
-    /// 按模型能力推导上下文输入预算：窗口的 3/4（预留输出与系统空间），
-    /// 下限 8,000。`max_context_tokens` 显式设置时优先。
-    pub fn context_budget(&self) -> XduduResult<usize> {
+    /// 模型上下文窗口（Token）：显式 `max_context_tokens` 优先，否则按内置表。
+    pub fn context_window(&self) -> XduduResult<usize> {
         let window = if self.max_context_tokens == 0 {
             model_context_window(&self.name, &self.model)
         } else {
@@ -96,7 +95,19 @@ impl ProviderConfig {
                 "provider.max_context_tokens 必须是 16384 到 1048576 之间的整数。",
             ));
         }
-        Ok((window * 3 / 4).max(8_000))
+        Ok(window)
+    }
+
+    /// 软阈值（对齐 Codex auto_compact_token_limit）：窗口的 90%，超出触发
+    /// 自动上下文压缩；`max_context_tokens` 显式设置时基于该窗口计算。
+    pub fn context_budget(&self) -> XduduResult<usize> {
+        Ok((self.context_window()? * 9 / 10).max(8_000))
+    }
+
+    /// 硬顶（对齐 Codex effective_context_window_percent）：窗口的 95%，
+    /// 真实用量超过时必须强制压缩，防止突破模型上下文窗口。
+    pub fn context_hard_limit(&self) -> XduduResult<usize> {
+        Ok((self.context_window()? * 95 / 100).max(8_000))
     }
 }
 
@@ -1632,30 +1643,33 @@ mod tests {
 
     #[test]
     fn 上下文预算按模型窗口推导() {
-        // deepseek 128K → 预算 96K（窗口的 3/4）。
+        // deepseek 128K → 软阈值 115200（90%）/ 硬顶 121600（95%）。
         let deepseek = ProviderConfig {
             name: "deepseek".into(),
             model: "deepseek-chat".into(),
             max_context_tokens: 0,
             ..ProviderConfig::default()
         };
-        assert_eq!(deepseek.context_budget().unwrap(), 96_000);
-        // anthropic claude 200K → 预算 150K。
+        assert_eq!(deepseek.context_budget().unwrap(), 115_200);
+        assert_eq!(deepseek.context_hard_limit().unwrap(), 121_600);
+        // anthropic claude 200K → 软 180K / 硬 190K。
         let claude = ProviderConfig {
             name: "anthropic".into(),
             model: "claude-sonnet-4-5".into(),
             max_context_tokens: 0,
             ..ProviderConfig::default()
         };
-        assert_eq!(claude.context_budget().unwrap(), 150_000);
-        // openai-compatible 未知模型 → 保守 64K → 预算 48K。
+        assert_eq!(claude.context_budget().unwrap(), 180_000);
+        assert_eq!(claude.context_hard_limit().unwrap(), 190_000);
+        // openai-compatible 未知模型 → 保守 64K → 软 57600 / 硬 60800。
         let custom = ProviderConfig {
             name: "openai-compatible".into(),
             model: "my-model".into(),
             max_context_tokens: 0,
             ..ProviderConfig::default()
         };
-        assert_eq!(custom.context_budget().unwrap(), 48_000);
+        assert_eq!(custom.context_budget().unwrap(), 57_600);
+        assert_eq!(custom.context_hard_limit().unwrap(), 60_800);
         // 显式能力声明覆盖内置表。
         let overridden = ProviderConfig {
             name: "openai-compatible".into(),
@@ -1663,7 +1677,8 @@ mod tests {
             max_context_tokens: 200_000,
             ..ProviderConfig::default()
         };
-        assert_eq!(overridden.context_budget().unwrap(), 150_000);
+        assert_eq!(overridden.context_budget().unwrap(), 180_000);
+        assert_eq!(overridden.context_hard_limit().unwrap(), 190_000);
         // 非法窗口拒绝。
         let invalid = ProviderConfig {
             name: "openai-compatible".into(),
@@ -1672,6 +1687,7 @@ mod tests {
             ..ProviderConfig::default()
         };
         assert!(invalid.context_budget().is_err());
+        assert!(invalid.context_hard_limit().is_err());
     }
 
     #[test]
