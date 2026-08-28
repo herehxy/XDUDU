@@ -428,8 +428,8 @@ async fn compact_context(ctx: CompactContext<'_>) -> CompactOutcome {
     // 真实计算（对齐 Codex token_limit_reached）：上一轮 Provider 上报的真实
     // 输入 Token 是权威依据，达到软阈值（窗口×90%）即触发压缩，不再看投影
     // 估算"能否消化"；字符估算仅作无真实用量时（冷启动）的判据。
-    // 真实用量达到硬顶（窗口×95%）时额外强制 L2 确定性截断（见下方
-    // baseline_over_hard），防止估算低估撞破模型窗口。
+    // 真实用量达到硬顶（窗口×95%）时额外强制 L2 确定性截断（强制标志见
+    // 下方确定性截断调用），防止估算低估撞破模型窗口。
     let real_over_budget = real_input_tokens
         .is_some_and(|tokens| usize::try_from(tokens).unwrap_or(usize::MAX) >= budget);
     let real_over_hard = real_input_tokens
@@ -3278,6 +3278,57 @@ mod tests {
         .await;
         assert!(matches!(outcome, CompactOutcome::Deterministic));
         assert!(session.summarized_message_count > 0);
+    }
+
+    #[tokio::test]
+    async fn 软硬区间估算未超预算时确定性截断保持宽容() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let mut session = Session {
+            id: Uuid::new_v4(),
+            title: "软硬区间宽容".into(),
+            cwd: dir.path().to_path_buf(),
+            status: SessionStatus::Running,
+            current_state: AgentLoopState::Planning,
+            plan: Value::Null,
+            provider_name: "mock".into(),
+            model: "test".into(),
+            messages: vec![
+                new_message(MessageRole::User, "请求", 0),
+                new_message(MessageRole::Assistant, "回答", 1),
+            ],
+            tool_calls: Vec::new(),
+            context_summary: String::new(),
+            summarized_message_count: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        // 设计边界：真实用量处于软/硬阈值之间（软阈值触发压缩），但基线与
+        // 投影估算都未超预算且 L3 不可用时，L2 保持宽容不强行截断——压缩
+        // 交还给 L3，硬顶（95%）才是最终兜底。
+        let budget = 7_000;
+        let outcome = compact_context(CompactContext {
+            session: &mut session,
+            system: "系统约束",
+            tools_json: "[]",
+            provider: None,
+            model: "test",
+            temperature: 0.2,
+            max_output_tokens: 4096,
+            reasoning: false,
+            cancellation: CancellationToken::new(),
+            budget,
+            hard_limit: budget * 2,
+            force: false,
+            real_input_tokens: Some(budget as u64),
+            event_sink: None,
+        })
+        .await;
+        assert!(matches!(outcome, CompactOutcome::None));
+        assert_eq!(session.summarized_message_count, 0);
     }
 
     #[tokio::test]
